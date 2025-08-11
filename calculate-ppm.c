@@ -1,0 +1,296 @@
+#include <stdio.h>
+#include <stdbool.h>
+#include <getopt.h>
+
+#include <fftw3.h>
+
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/avutil.h>
+
+#define MAX_PULSES 512
+bool enable_debug = false;
+
+typedef struct _Pulse {
+    uint32_t start;
+    uint32_t end;
+    float max_power;
+    float min_power;
+} Pulse;
+
+void debug_log(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    if(enable_debug) vfprintf(stderr, fmt, args);
+    va_end(args);
+}
+
+float calculate_power(float *samples, int length) {
+    float power = 0;
+    for(int i = 0; i < length; i++) {
+        power += pow(samples[i], 2);
+    }
+    return sqrt(power / length);
+}
+
+float correlate_blocks(float *a, float *b, float *out, int length) {
+    float correlation = 0;
+    float max = 0.0f;
+
+    int possible = 0;
+    for(int i = 0; i < length; i++) {
+        correlation = 0;
+        possible = 0;
+        for(int j = 0; j < length - i; j++) {
+            possible++;
+            correlation += a[i] * b[j + i];
+            //correlation += b[i] * a[j + i];
+        }
+
+        out[i] = correlation / (possible * 1);
+        if(out[i] > max) max = out[i];
+    }
+
+    // After correlating, copy to the old block and normalize it
+    memcpy(a, b, sizeof(float) * length);
+    return max;
+}
+
+FILE *decode_audio_file(char *path, int *sample_rate) {
+    FILE *tmp_fh;
+    AVFormatContext *fmt_ctx = NULL;
+    AVCodecContext *codec_ctx = NULL;
+    const AVCodec *codec = NULL;
+    AVPacket *packet = NULL;
+    AVFrame *frame = NULL;
+    int audio_stream_idx = -1;
+
+    tmp_fh = tmpfile();
+    if(tmp_fh == NULL) {
+        fprintf(stderr, "Could not create temporary file.");
+        return NULL;
+    }
+
+    if (avformat_open_input(&fmt_ctx, path, NULL, NULL) < 0) {
+        fprintf(stderr, "Could not open %s\n", path);
+        return NULL;
+    }
+
+    if (avformat_find_stream_info(fmt_ctx, NULL) < 0) {
+        fprintf(stderr, "Error looking up stream info.\n");
+        return NULL;
+    }
+
+    // 2. Find the audio stream
+    for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            audio_stream_idx = i;
+            break;
+        }
+    }
+
+    codec = avcodec_find_decoder(fmt_ctx->streams[audio_stream_idx]->codecpar->codec_id);
+    codec_ctx = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(codec_ctx, fmt_ctx->streams[audio_stream_idx]->codecpar);
+    *sample_rate = codec_ctx->sample_rate;
+
+    if (avcodec_open2(codec_ctx, codec, NULL) < 0) {
+        fprintf(stderr, "avcodec_open2 error.\n");
+        return NULL;
+    }
+
+    packet = av_packet_alloc();
+    frame  = av_frame_alloc();
+    while (av_read_frame(fmt_ctx, packet) >= 0) {
+        if (packet->stream_index == audio_stream_idx) {
+            if (avcodec_send_packet(codec_ctx, packet) >= 0) {
+                while (avcodec_receive_frame(codec_ctx, frame) >= 0) {
+                    float *samples = (float *)frame->data[0];
+                    fwrite(samples, sizeof(float), frame->nb_samples, tmp_fh);
+                }
+            }
+        }
+        av_packet_unref(packet);
+    }
+
+    av_packet_free(&packet);
+    av_frame_free(&frame);
+    avcodec_free_context(&codec_ctx);
+    avformat_close_input(&fmt_ctx);
+
+    fseek(tmp_fh, 0, SEEK_SET);
+    return tmp_fh;
+}
+
+int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int block_size, float threshold, int min_pulse_duration, int max_pulses) {
+    float samples[block_size];
+    int min_pulse_samples = (sample_rate / 1000) * min_pulse_duration;
+    int pulse_samples = 0;
+    int sample_number = 0;
+    int pulse_count   = 0;
+    size_t bytes;
+
+    while((bytes = fread(samples, sizeof(float), block_size, fh)) > 0) {
+        float power = calculate_power(samples, block_size);
+        if(power >= threshold) {
+            if(pulse_samples == 0) {
+                pulse[pulse_count].start = sample_number;
+                pulse[pulse_count].max_power = power;
+                pulse[pulse_count].min_power = power;
+            }
+            pulse_samples += block_size;
+            if(power > pulse[pulse_count].max_power) pulse[pulse_count].max_power = power;
+            if(power < pulse[pulse_count].min_power) pulse[pulse_count].min_power = power;
+        } else {
+            if(pulse_samples >= min_pulse_samples) {
+                if(pulse_count < max_pulses) pulse[pulse_count++].end = sample_number;
+            }
+            pulse_samples = 0;
+        }
+        sample_number += block_size;
+    }
+
+    return pulse_count;
+}
+
+void pulse_report(FILE *fh, Pulse *pulse, int pulse_count, int *chain, int chain_length, int sample_rate, int block_size) {
+    int pulse_delay = 0;
+    int fft_size = 512;
+    float buffer[fft_size];
+    double in[fft_size];
+    float amplitudes[fft_size];
+    fftw_complex out[fft_size];
+    fftw_plan fftwp = fftw_plan_dft_r2c_1d(fft_size, in, out, FFTW_ESTIMATE);
+
+    for(int c = 0; c < chain_length; c++) {
+        int p = chain[c];
+        int p2 = chain[c - 1];
+        if(c > 0) pulse_delay += pulse[p].start - pulse[p2].start;
+
+        fseek(fh, (pulse[p].start + block_size) * sizeof(float), SEEK_SET);
+        fread(buffer, sizeof(float), fft_size, fh);
+        //if(p == 7) fwrite(buffer, sizeof(float), fft_size, stdout);
+        for(int i = 0; i < fft_size; i++) in[i] = buffer[i] * 0.5 * (1.0 - cos(2 * M_PI * i / fft_size));
+        fftw_execute(fftwp);
+
+        float max_power = 0.0f;
+        int max_index = 0;
+        for(int i = 0; i < fft_size / 2; i++) {
+            float power = fsqrt((out[i][0] * out[i][0]) + (out[i][1] * out[i][1]));
+            if(power > max_power) {
+                max_power = power;
+                max_index = i;
+            }
+            amplitudes[i] = power;
+        }
+
+        float y1 = amplitudes[max_index - 1];
+        float y2 = amplitudes[max_index];
+        float y3 = amplitudes[max_index + 1];
+        float y  = 0.5 * (y1 - y3) / (y1 - (2.0 * y2) + y3);
+        float freq = ((max_index + y) * (sample_rate / fft_size));
+
+        debug_log("%.1f Hz pulse with power %f/%f starting at %i (%0.3f seconds) ending at %i (%i samples, %0.3fs)", freq, pulse[p].min_power, pulse[p].max_power, pulse[p].start, ((float)pulse[p].start / sample_rate),pulse[p].end, pulse[p].end - pulse[p].start, (float)(pulse[p].end - pulse[p].start) / sample_rate);
+        if(c > 0) debug_log(", %i samples (%0.3f seconds) since last pulse", pulse[p].end - pulse[p2].end, (float)(pulse[p].end - pulse[p2].end) / sample_rate);
+        debug_log("\n");
+    }
+
+    fftw_destroy_plan(fftwp);
+
+    float avg_delay = ((float)pulse_delay / (chain_length - 1)) / sample_rate;
+    float ppm = 60.0f / avg_delay;
+    printf("{\"count\": %i, \"delay\": %f, \"ppm\": %f, \"temp\": %0.2f}\n", chain_length, avg_delay, ppm, (ppm * (9.0/5.0)) + 32);
+
+}
+
+int find_pulse_chain(Pulse *pulse, int pulse_count, int *chain, int min_chain_length, int max_chain_length, int tolerance, int array_position, int chain_position) {
+    int l1 = array_position;
+    int l2 = array_position + 1;
+    int l3 = array_position + 2;
+    int dt = ((pulse[l2].end - pulse[l1].end) + (pulse[l2].start - pulse[l1].start)) / 2;
+    int d = 0;
+    int chain_length = 2;
+
+    chain[0] = l1;
+    chain[1] = l2;
+
+    // Can't find a chain if pulse_count is too low
+    if(pulse_count < 3 || pulse_count < min_chain_length) return 0;
+
+    while(l1 < pulse_count - 2 && l2 < pulse_count - 1 && l3 < pulse_count) {
+        d = ((pulse[l3].end - pulse[l2].end) + (pulse[l3].start - pulse[l2].start)) / 2;
+
+        if(abs(dt - d) <= tolerance) {
+            // Valid link found
+            chain[chain_length] = l3;
+            chain_length++;
+            l2 = l3;
+            l3++;
+        } else if(d > dt) {
+            // Further chain is imposible from these nodes
+            // If we have enough links, break out of the loop
+            if(chain_length >= min_chain_length) break;
+
+            // If not, keep checking
+            l1++;
+            l2 = l1 + 1;
+            l3 = l2 + 1;
+            dt = ((pulse[l2].end - pulse[l1].end) + (pulse[l2].start - pulse[l1].start)) / 2;
+            chain_length = 2;
+            chain[0] = l1;
+            chain[1] = l2;
+        } else {
+            // Check next possible link
+            l3++;
+        }
+    }
+
+    // No chain found
+    return chain_length;
+}
+
+int main(int argc, char **argv) {
+    char *filename;
+    int block_size         = 64;
+    int min_pulse_duration = 15;
+    float threshold        = 0.05;
+    int sample_rate;
+    int opt;
+
+    Pulse pulse[MAX_PULSES];
+
+    while((opt = getopt(argc, argv, "d:f:l:t:v")) != -1) {
+        switch(opt) {
+            case 'd': min_pulse_duration = atoi(optarg); break;
+            case 'f': filename = optarg; break;
+            case 'l': block_size = atoi(optarg); break;
+            case 't': threshold = atof(optarg); break;
+            case 'v': enable_debug = true; break;
+        }
+    }
+
+    freopen(NULL, "wb", stdout);
+
+    // Decode the m4a file to a temporary file full of floats
+    FILE *fh = decode_audio_file(filename, &sample_rate);
+    if(fh == NULL) {
+        fprintf(stderr, "There was an error decoding %s\n", filename);
+        return -1;
+    }
+
+    // Detect pulses
+    int pulse_count = detect_pulses(fh, pulse, sample_rate, block_size, threshold, min_pulse_duration, MAX_PULSES);
+
+    int chain[MAX_PULSES];
+    int chain_length = find_pulse_chain(pulse, pulse_count, chain, 5, MAX_PULSES, block_size, 0, 0);
+
+    //debug_log("chain found with %i links.\n", chain_length);
+    //for(int i = 0; i < chain_length; i++) {
+    //    debug_log("linked pulse at %.3f seconds.\n", (float)pulse[chain[i]].start / sample_rate);
+    //}
+
+    // Output pulse report
+    pulse_report(fh, pulse, pulse_count, chain, chain_length, sample_rate, block_size);
+
+    return 0;
+}
