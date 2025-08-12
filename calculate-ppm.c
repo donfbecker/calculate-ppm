@@ -1,12 +1,15 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <getopt.h>
+#include <math.h>
 
 #include <fftw3.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
+
+#include "rcfilter.h"
 
 #define MAX_PULSES 512
 bool enable_debug = false;
@@ -122,7 +125,7 @@ FILE *decode_audio_file(char *path, int *sample_rate) {
     return tmp_fh;
 }
 
-int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int block_size, float threshold, int min_pulse_duration, int max_pulses) {
+int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int block_size, float threshold, int min_pulse_duration, int max_pulses, bool use_hpf) {
     float samples[block_size];
     int min_pulse_samples = (sample_rate / 1000) * min_pulse_duration;
     int pulse_samples = 0;
@@ -130,7 +133,15 @@ int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int block_size, float
     int pulse_count   = 0;
     size_t bytes;
 
+    RCFilter filter;
+    RCFilter_init(&filter, RC_FILTER_HIGHPASS, 500.0f, 1.0f / sample_rate);
+
+    fseek(fh, 0, SEEK_SET);
     while((bytes = fread(samples, sizeof(float), block_size, fh)) > 0) {
+        if(use_hpf) {
+            for(int i = 0; i < block_size; i++) samples[i] = RCFilter_update(&filter, samples[i]);
+        }
+
         float power = calculate_power(samples, block_size);
         if(power >= threshold) {
             if(pulse_samples == 0) {
@@ -153,7 +164,7 @@ int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int block_size, float
     return pulse_count;
 }
 
-void pulse_report(FILE *fh, Pulse *pulse, int pulse_count, int *chain, int chain_length, int sample_rate, int block_size) {
+void pulse_report(FILE *fh, Pulse *pulse, int pulse_count, int sample_rate, int block_size) {
     int pulse_delay = 0;
     int fft_size = 512;
     float buffer[fft_size];
@@ -162,21 +173,19 @@ void pulse_report(FILE *fh, Pulse *pulse, int pulse_count, int *chain, int chain
     fftw_complex out[fft_size];
     fftw_plan fftwp = fftw_plan_dft_r2c_1d(fft_size, in, out, FFTW_ESTIMATE);
 
-    for(int c = 0; c < chain_length; c++) {
-        int p = chain[c];
-        int p2 = chain[c - 1];
-        if(c > 0) pulse_delay += pulse[p].start - pulse[p2].start;
+    for(int p = 0; p < pulse_count; p++) {
+        int p2 = p - 1;
+        if(p > 0) pulse_delay += pulse[p].start - pulse[p2].start;
 
         fseek(fh, (pulse[p].start + block_size) * sizeof(float), SEEK_SET);
         fread(buffer, sizeof(float), fft_size, fh);
-        //if(p == 7) fwrite(buffer, sizeof(float), fft_size, stdout);
         for(int i = 0; i < fft_size; i++) in[i] = buffer[i] * 0.5 * (1.0 - cos(2 * M_PI * i / fft_size));
         fftw_execute(fftwp);
 
         float max_power = 0.0f;
         int max_index = 0;
         for(int i = 0; i < fft_size / 2; i++) {
-            float power = fsqrt((out[i][0] * out[i][0]) + (out[i][1] * out[i][1]));
+            float power = sqrtf((out[i][0] * out[i][0]) + (out[i][1] * out[i][1]));
             if(power > max_power) {
                 max_power = power;
                 max_index = i;
@@ -191,25 +200,24 @@ void pulse_report(FILE *fh, Pulse *pulse, int pulse_count, int *chain, int chain
         float freq = ((max_index + y) * (sample_rate / fft_size));
 
         debug_log("%.1f Hz pulse with power %f/%f starting at %i (%0.3f seconds) ending at %i (%i samples, %0.3fs)", freq, pulse[p].min_power, pulse[p].max_power, pulse[p].start, ((float)pulse[p].start / sample_rate),pulse[p].end, pulse[p].end - pulse[p].start, (float)(pulse[p].end - pulse[p].start) / sample_rate);
-        if(c > 0) debug_log(", %i samples (%0.3f seconds) since last pulse", pulse[p].end - pulse[p2].end, (float)(pulse[p].end - pulse[p2].end) / sample_rate);
+        if(p > 0) debug_log(", %i samples (%0.3f seconds) since last pulse", pulse[p].end - pulse[p2].end, (float)(pulse[p].end - pulse[p2].end) / sample_rate);
         debug_log("\n");
     }
 
     fftw_destroy_plan(fftwp);
 
-    float avg_delay = ((float)pulse_delay / (chain_length - 1)) / sample_rate;
+    float avg_delay = ((float)pulse_delay / (pulse_count - 1)) / sample_rate;
     float ppm = 60.0f / avg_delay;
-    printf("{\"count\": %i, \"delay\": %f, \"ppm\": %f, \"temp\": %0.2f}\n", chain_length, avg_delay, ppm, (ppm * (9.0/5.0)) + 32);
+    printf("{\"count\": %i, \"delay\": %f, \"ppm\": %f, \"temp\": %0.2f}\n", pulse_count, avg_delay, ppm, (ppm * (9.0/5.0)) + 32);
 
 }
 
-int find_pulse_chain(Pulse *pulse, int pulse_count, int *chain, int min_chain_length, int max_chain_length, int tolerance, int array_position, int chain_position) {
-    int l1 = array_position;
-    int l2 = array_position + 1;
-    int l3 = array_position + 2;
+int find_pulse_chain(Pulse *pulse, int pulse_count, int min_chain_length, int max_chain_length, int tolerance) {
+    int chain[max_chain_length], longest_chain[max_chain_length];
+    int chain_length = 2, longest_chain_length = 0;
+    int l1 = 0, l2 = 1, l3 = 2;
     int dt = ((pulse[l2].end - pulse[l1].end) + (pulse[l2].start - pulse[l1].start)) / 2;
     int d = 0;
-    int chain_length = 2;
 
     chain[0] = l1;
     chain[1] = l2;
@@ -218,6 +226,7 @@ int find_pulse_chain(Pulse *pulse, int pulse_count, int *chain, int min_chain_le
     if(pulse_count < 3 || pulse_count < min_chain_length) return 0;
 
     while(l1 < pulse_count - 2 && l2 < pulse_count - 1 && l3 < pulse_count) {
+        // Using the average distance between starts and ends ensures uniform pulse length also
         d = ((pulse[l3].end - pulse[l2].end) + (pulse[l3].start - pulse[l2].start)) / 2;
 
         if(abs(dt - d) <= tolerance) {
@@ -228,10 +237,13 @@ int find_pulse_chain(Pulse *pulse, int pulse_count, int *chain, int min_chain_le
             l3++;
         } else if(d > dt) {
             // Further chain is imposible from these nodes
-            // If we have enough links, break out of the loop
-            if(chain_length >= min_chain_length) break;
+            // If we have enough links, see if it's the longest chain
+            if(chain_length >= min_chain_length && chain_length > longest_chain_length) {
+                memcpy(longest_chain, chain, sizeof(int) * chain_length);
+                longest_chain_length = chain_length;
+            }
 
-            // If not, keep checking
+            // Look for a longer chain
             l1++;
             l2 = l1 + 1;
             l3 = l2 + 1;
@@ -245,8 +257,19 @@ int find_pulse_chain(Pulse *pulse, int pulse_count, int *chain, int min_chain_le
         }
     }
 
+    // Did we reach the end of the loop?
+    if(chain_length > longest_chain_length) {
+        memcpy(longest_chain, chain, sizeof(int) * chain_length);
+        longest_chain_length = chain_length;
+    }
+
+    // Iterate over longest chain and rearrange pulses
+    for(int i = 0; i < longest_chain_length; i++) {
+        pulse[i] = pulse[longest_chain[i]];
+    }
+
     // No chain found
-    return chain_length;
+    return longest_chain_length;
 }
 
 int main(int argc, char **argv) {
@@ -255,15 +278,17 @@ int main(int argc, char **argv) {
     int min_pulse_duration = 15;
     float threshold        = 0.05;
     int sample_rate;
+    bool open_raw = false;
     int opt;
 
     Pulse pulse[MAX_PULSES];
 
-    while((opt = getopt(argc, argv, "d:f:l:t:v")) != -1) {
+    while((opt = getopt(argc, argv, "d:f:l:r:t:v")) != -1) {
         switch(opt) {
             case 'd': min_pulse_duration = atoi(optarg); break;
             case 'f': filename = optarg; break;
             case 'l': block_size = atoi(optarg); break;
+            case 'r': open_raw = true; sample_rate = atoi(optarg); break;
             case 't': threshold = atof(optarg); break;
             case 'v': enable_debug = true; break;
         }
@@ -272,25 +297,33 @@ int main(int argc, char **argv) {
     freopen(NULL, "wb", stdout);
 
     // Decode the m4a file to a temporary file full of floats
-    FILE *fh = decode_audio_file(filename, &sample_rate);
+    FILE *fh;
+    if(open_raw) {
+        fh = fopen(filename, "rb");
+    } else {
+        fh = decode_audio_file(filename, &sample_rate);
+    }
     if(fh == NULL) {
-        fprintf(stderr, "There was an error decoding %s\n", filename);
+        fprintf(stderr, "There was an error opening %s\n", filename);
         return -1;
     }
 
-    // Detect pulses
-    int pulse_count = detect_pulses(fh, pulse, sample_rate, block_size, threshold, min_pulse_duration, MAX_PULSES);
+    float t = threshold * 5;
+    int pulse_count = 0;
+    for(int hpf = 0; hpf < 2; hpf++) {
+        for(t = threshold * 5; t >= threshold; t -= threshold) {
+            // Detect pulses
+            pulse_count = detect_pulses(fh, pulse, sample_rate, block_size, threshold, min_pulse_duration, MAX_PULSES, hpf > 0);
 
-    int chain[MAX_PULSES];
-    int chain_length = find_pulse_chain(pulse, pulse_count, chain, 5, MAX_PULSES, block_size, 0, 0);
+            // Find evenly spaced pulses
+            pulse_count = find_pulse_chain(pulse, pulse_count, 5, MAX_PULSES, block_size);
 
-    //debug_log("chain found with %i links.\n", chain_length);
-    //for(int i = 0; i < chain_length; i++) {
-    //    debug_log("linked pulse at %.3f seconds.\n", (float)pulse[chain[i]].start / sample_rate);
-    //}
+            if(pulse_count >= 5) break;
+        }
+    }
 
     // Output pulse report
-    pulse_report(fh, pulse, pulse_count, chain, chain_length, sample_rate, block_size);
+    pulse_report(fh, pulse, pulse_count, sample_rate, block_size);
 
     return 0;
 }
