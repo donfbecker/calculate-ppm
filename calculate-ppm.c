@@ -125,6 +125,31 @@ FILE *decode_audio_file(char *path, int *sample_rate) {
     return tmp_fh;
 }
 
+float calculate_ppm(Pulse *pulse, int pulse_count, int sample_rate) {
+    int pulse_delay = 0, avg_delay, ppm;
+
+    for(int p = 1; p < pulse_count; p++) pulse_delay += pulse[p].start - pulse[p - 1].start;
+    avg_delay = ((float)pulse_delay / (pulse_count - 1)) / sample_rate;
+    ppm = 60.0f / avg_delay;
+
+    return ppm;
+}
+
+float calculate_max_power(FILE *fh, int block_size) {
+    float samples[block_size];
+    float max_power = 0.0f;
+    float power;
+    size_t bytes;
+
+    fseek(fh, 0, SEEK_SET);
+    while((bytes = fread(samples, sizeof(float), block_size, fh)) > 0) {
+        power = calculate_power(samples, block_size);
+        if(power > max_power) max_power = power;
+    }
+
+    return max_power;
+}
+
 int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int block_size, float threshold, int min_pulse_duration, int max_pulses, bool use_hpf) {
     float samples[block_size];
     int min_pulse_samples = (sample_rate / 1000) * min_pulse_duration;
@@ -143,6 +168,7 @@ int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int block_size, float
         }
 
         float power = calculate_power(samples, block_size);
+
         if(power >= threshold) {
             if(pulse_samples == 0) {
                 pulse[pulse_count].start = sample_number;
@@ -308,17 +334,34 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    float t = threshold * 5;
+    // Find max power
+    float max_power = calculate_max_power(fh, block_size);
+    debug_log("max_power = %f\n", max_power);
+
+    bool signal_found = false;
     int pulse_count = 0;
+    float t_value[] = {1.0f, 0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f, 0.3f, 0.2f, 0.1f, 0.09f, 0.08f, 0.07f, 0.06f, 0.05f, 0.04f, 0.03f, 0.02f, 0.01f};
+    int t_count = sizeof(t_value) / sizeof(float);
     for(int hpf = 0; hpf < 2; hpf++) {
-        for(t = threshold * 5; t >= threshold; t -= threshold) {
+        if(signal_found) break;
+
+        for(int i = 0; i < t_count; i++) {
+            // Set threshold
+            float t = t_value[i];
+            if(t > max_power) continue;
+
             // Detect pulses
-            pulse_count = detect_pulses(fh, pulse, sample_rate, block_size, threshold, min_pulse_duration, MAX_PULSES, hpf > 0);
+            pulse_count = detect_pulses(fh, pulse, sample_rate, block_size, t, min_pulse_duration, MAX_PULSES, hpf > 0);
 
             // Find evenly spaced pulses
             pulse_count = find_pulse_chain(pulse, pulse_count, 5, MAX_PULSES, block_size);
 
-            if(pulse_count >= 5) break;
+            float ppm = calculate_ppm(pulse, pulse_count, sample_rate);
+
+            if(pulse_count >= 5 && ppm >= 5.0f && ppm < 100.0f) {
+                signal_found = true;
+                break;
+            }
         }
     }
 
