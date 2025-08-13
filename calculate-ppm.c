@@ -258,7 +258,7 @@ int find_pulse_chain(Pulse *pulse, int pulse_count, int min_chain_length, int ma
     // Can't find a chain if pulse_count is too low
     if(pulse_count < 3 || pulse_count < min_chain_length) return 0;
 
-    while(l1 < pulse_count - min_chain_length) {
+    while(l1 < pulse_count - (min_chain_length - 1)) {
         // Using the average distance between starts and ends ensures uniform pulse length also
         d = ((pulse[l3].end - pulse[l2].end) + (pulse[l3].start - pulse[l2].start)) / 2;
 
@@ -361,7 +361,7 @@ int main(int argc, char **argv) {
             if(t > max_power) continue;
 
             // Detect pulses
-            total_pulse_count = detect_pulses(fh, pulse, sample_rate, block_size, t, min_pulse_duration, MAX_PULSES, true);
+            total_pulse_count = detect_pulses(fh, pulse, sample_rate, block_size, t, min_pulse_duration, MAX_PULSES, hpf > 0);
 
             // Find evenly spaced pulses
             pulse_count = find_pulse_chain(pulse, total_pulse_count, 5, MAX_PULSES, block_size);
