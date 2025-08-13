@@ -190,14 +190,16 @@ int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int block_size, float
     return pulse_count;
 }
 
-void pulse_report(FILE *fh, Pulse *pulse, int pulse_count, int sample_rate, int block_size) {
+void pulse_report(FILE *fh, Pulse *pulse, int pulse_count, int total_pulse_count, int sample_rate, int block_size) {
     int pulse_delay = 0;
+    float freq_sum = 0.0f;
     int fft_size = 512;
     float buffer[fft_size];
     double in[fft_size];
     float amplitudes[fft_size];
     fftw_complex out[fft_size];
     fftw_plan fftwp = fftw_plan_dft_r2c_1d(fft_size, in, out, FFTW_ESTIMATE);
+
 
     for(int p = 0; p < pulse_count; p++) {
         int p2 = p - 1;
@@ -208,11 +210,14 @@ void pulse_report(FILE *fh, Pulse *pulse, int pulse_count, int sample_rate, int 
         for(int i = 0; i < fft_size; i++) in[i] = buffer[i] * 0.5 * (1.0 - cos(2 * M_PI * i / fft_size));
         fftw_execute(fftwp);
 
+        float hpb = (float)sample_rate / fft_size;
+        int low_bin = floor(500.0f / hpb);
+        int high_bin = ceil(4000.0f / hpb);
         float max_power = 0.0f;
         int max_index = 0;
         for(int i = 0; i < fft_size / 2; i++) {
             float power = sqrtf((out[i][0] * out[i][0]) + (out[i][1] * out[i][1]));
-            if(power > max_power) {
+            if(i >= low_bin && i <= high_bin && power > max_power) {
                 max_power = power;
                 max_index = i;
             }
@@ -224,6 +229,7 @@ void pulse_report(FILE *fh, Pulse *pulse, int pulse_count, int sample_rate, int 
         float y3 = amplitudes[max_index + 1];
         float y  = 0.5 * (y1 - y3) / (y1 - (2.0 * y2) + y3);
         float freq = ((max_index + y) * (sample_rate / fft_size));
+        freq_sum += freq;
 
         debug_log("%.1f Hz pulse with power %f/%f starting at %i (%0.3f seconds) ending at %i (%i samples, %0.3fs)", freq, pulse[p].min_power, pulse[p].max_power, pulse[p].start, ((float)pulse[p].start / sample_rate),pulse[p].end, pulse[p].end - pulse[p].start, (float)(pulse[p].end - pulse[p].start) / sample_rate);
         if(p > 0) debug_log(", %i samples (%0.3f seconds) since last pulse", pulse[p].end - pulse[p2].end, (float)(pulse[p].end - pulse[p2].end) / sample_rate);
@@ -234,7 +240,8 @@ void pulse_report(FILE *fh, Pulse *pulse, int pulse_count, int sample_rate, int 
 
     float avg_delay = ((float)pulse_delay / (pulse_count - 1)) / sample_rate;
     float ppm = 60.0f / avg_delay;
-    printf("{\"count\": %i, \"delay\": %f, \"ppm\": %f, \"temp\": %0.2f}\n", pulse_count, avg_delay, ppm, (ppm * (9.0/5.0)) + 32);
+    float avg_freq = freq_sum / pulse_count;
+    printf("{\"count\": %i, \"frequency\": %.1f, \"delay\": %f, \"ppm\": %f, \"temp\": %0.2f, \"confidence\": %0.2f}\n", pulse_count, avg_freq, avg_delay, ppm, (ppm * (9.0/5.0)) + 32, ((float)pulse_count / total_pulse_count) * 100);
 
 }
 
@@ -251,7 +258,7 @@ int find_pulse_chain(Pulse *pulse, int pulse_count, int min_chain_length, int ma
     // Can't find a chain if pulse_count is too low
     if(pulse_count < 3 || pulse_count < min_chain_length) return 0;
 
-    while(l1 < pulse_count - 2 && l2 < pulse_count - 1 && l3 < pulse_count) {
+    while(l1 < pulse_count - min_chain_length) {
         // Using the average distance between starts and ends ensures uniform pulse length also
         d = ((pulse[l3].end - pulse[l2].end) + (pulse[l3].start - pulse[l2].start)) / 2;
 
@@ -265,6 +272,7 @@ int find_pulse_chain(Pulse *pulse, int pulse_count, int min_chain_length, int ma
             // Further chain is imposible from these nodes
             // If we have enough links, see if it's the longest chain
             if(chain_length >= min_chain_length && chain_length > longest_chain_length) {
+                debug_log("Found new pulse chain with length %i\n", chain_length);
                 memcpy(longest_chain, chain, sizeof(int) * chain_length);
                 longest_chain_length = chain_length;
             }
@@ -303,14 +311,16 @@ int main(int argc, char **argv) {
     int block_size         = 64;
     int min_pulse_duration = 15;
     float threshold        = 0.05;
+    int required_pulses    = 5;
     int sample_rate;
     bool open_raw = false;
     int opt;
 
     Pulse pulse[MAX_PULSES];
 
-    while((opt = getopt(argc, argv, "d:f:l:r:t:v")) != -1) {
+    while((opt = getopt(argc, argv, "c:d:f:l:r:t:v")) != -1) {
         switch(opt) {
+            case 'c': required_pulses = atoi(optarg); break;
             case 'd': min_pulse_duration = atoi(optarg); break;
             case 'f': filename = optarg; break;
             case 'l': block_size = atoi(optarg); break;
@@ -339,7 +349,7 @@ int main(int argc, char **argv) {
     debug_log("max_power = %f\n", max_power);
 
     bool signal_found = false;
-    int pulse_count = 0;
+    int pulse_count = 0, total_pulse_count = 0;
     float t_value[] = {1.0f, 0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f, 0.3f, 0.2f, 0.1f, 0.09f, 0.08f, 0.07f, 0.06f, 0.05f, 0.04f, 0.03f, 0.02f, 0.01f};
     int t_count = sizeof(t_value) / sizeof(float);
     for(int hpf = 0; hpf < 2; hpf++) {
@@ -351,14 +361,14 @@ int main(int argc, char **argv) {
             if(t > max_power) continue;
 
             // Detect pulses
-            pulse_count = detect_pulses(fh, pulse, sample_rate, block_size, t, min_pulse_duration, MAX_PULSES, hpf > 0);
+            total_pulse_count = detect_pulses(fh, pulse, sample_rate, block_size, t, min_pulse_duration, MAX_PULSES, true);
 
             // Find evenly spaced pulses
-            pulse_count = find_pulse_chain(pulse, pulse_count, 5, MAX_PULSES, block_size);
+            pulse_count = find_pulse_chain(pulse, total_pulse_count, 5, MAX_PULSES, block_size);
 
             float ppm = calculate_ppm(pulse, pulse_count, sample_rate);
 
-            if(pulse_count >= 5 && ppm >= 5.0f && ppm < 100.0f) {
+            if(pulse_count >= required_pulses && ppm >= 5.0f && ppm < 100.0f) {
                 signal_found = true;
                 break;
             }
@@ -366,7 +376,6 @@ int main(int argc, char **argv) {
     }
 
     // Output pulse report
-    pulse_report(fh, pulse, pulse_count, sample_rate, block_size);
-
+    pulse_report(fh, pulse, pulse_count, total_pulse_count, sample_rate, block_size);
     return 0;
 }
