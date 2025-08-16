@@ -5,11 +5,17 @@
 
 #include <fftw3.h>
 
+// Make sure this is after fftw3.h
+#include <complex.h>
+
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
 
 #include "rcfilter.h"
+
+#define MIN(a,b) (((a)<(b))?(a):(b))
+#define MAX(a,b) (((a)>(b))?(a):(b))
 
 #define MAX_PULSES 512
 bool enable_debug = false;
@@ -20,6 +26,15 @@ typedef struct _Pulse {
     float max_power;
     float min_power;
 } Pulse;
+
+typedef struct _PulseSummary {
+    int count;
+    float frequency;
+    float delay;
+    float ppm;
+    float temperature;
+    float confidence;
+} PulseSummary;
 
 void debug_log(const char *fmt, ...) {
     va_list args;
@@ -34,6 +49,33 @@ float calculate_power(float *samples, int length) {
         power += pow(samples[i], 2);
     }
     return sqrt(power / length);
+}
+
+_Complex float goertzel_dft_kernel(const float *samples, size_t length, int sample_rate, float frequency) {
+    _Complex float acc = 0.0f + 0.0f * I;
+    float omega = -2.0f * M_PI * (frequency / (float)sample_rate);
+    for (size_t n = 0; n < length; n++) {
+        acc += samples[n] * cexpf(I * omega * n);
+    }
+
+    return acc;
+}
+
+_Complex float goertzel_dft_kernel_real(const float *samples, size_t length, int sample_rate, float frequency) {
+    float omega = 2.0f * M_PI * (frequency / (float)sample_rate);
+    float coeff = 2.0f * cosf(omega);
+    float p1 = 0;
+    float p2 = 0;
+
+    for(size_t n = 0; n < length; n++) {
+        float s = samples[n] + (coeff * p1) - p2;
+        p2 = p1;
+        p1 = s;
+    }
+
+    float real = (p1 * cosf(omega) - p2);
+    float imag = (p1 * sinf(omega));
+    return real + (I * imag);
 }
 
 float correlate_blocks(float *a, float *b, float *out, int length) {
@@ -135,7 +177,7 @@ float calculate_ppm(Pulse *pulse, int pulse_count, int sample_rate) {
     return ppm;
 }
 
-float calculate_max_power(FILE *fh, int block_size) {
+float calculate_max_power(FILE *fh, int block_size, int sample_rate, float target_frequency) {
     float samples[block_size];
     float max_power = 0.0f;
     float power;
@@ -143,15 +185,20 @@ float calculate_max_power(FILE *fh, int block_size) {
 
     fseek(fh, 0, SEEK_SET);
     while((bytes = fread(samples, sizeof(float), block_size, fh)) > 0) {
-        power = calculate_power(samples, block_size);
+        if(target_frequency == 0) {
+            power = calculate_power(samples, block_size);
+        } else {
+            power = cabs(goertzel_dft_kernel(samples, block_size, sample_rate, target_frequency));
+        }
         if(power > max_power) max_power = power;
     }
 
     return max_power;
 }
 
-int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int block_size, float threshold, int min_pulse_duration, int max_pulses, bool use_hpf) {
-    float samples[block_size];
+uint8_t g_first_run = 1;
+int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int window_size, int block_size, float threshold, int min_pulse_duration, int max_pulses, float target_frequency) {
+    float samples[window_size];
     int min_pulse_samples = (sample_rate / 1000) * min_pulse_duration;
     int pulse_samples = 0;
     int sample_number = 0;
@@ -161,13 +208,19 @@ int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int block_size, float
     RCFilter filter;
     RCFilter_init(&filter, RC_FILTER_HIGHPASS, 500.0f, 1.0f / sample_rate);
 
-    fseek(fh, 0, SEEK_SET);
-    while((bytes = fread(samples, sizeof(float), block_size, fh)) > 0) {
-        if(use_hpf) {
-            for(int i = 0; i < block_size; i++) samples[i] = RCFilter_update(&filter, samples[i]);
-        }
+    int block_offset = window_size - block_size;
 
-        float power = calculate_power(samples, block_size);
+    fseek(fh, 0, SEEK_SET);
+    if(block_offset > 0) fread(samples, sizeof(float), block_offset, fh);
+    while((bytes = fread(&samples[block_offset], sizeof(float), block_size, fh)) > 0) {
+        float power;
+
+        if(target_frequency == 0) {
+            for(int i = block_offset; i < window_size; i++) samples[i] = RCFilter_update(&filter, samples[i]);
+            power = calculate_power(samples, window_size);
+        } else {
+            power = cabs(goertzel_dft_kernel(samples, window_size, sample_rate, target_frequency));
+        }
 
         if(power >= threshold) {
             if(pulse_samples == 0) {
@@ -184,13 +237,16 @@ int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int block_size, float
             }
             pulse_samples = 0;
         }
+
         sample_number += block_size;
+        if(block_offset > 0) memmove(samples, &samples[block_size], sizeof(float) * block_offset);
     }
 
+    if(target_frequency != 0) g_first_run = 0;
     return pulse_count;
 }
 
-void pulse_report(FILE *fh, Pulse *pulse, int pulse_count, int total_pulse_count, int sample_rate, int block_size) {
+void pulse_report(FILE *fh, Pulse *pulse, int pulse_count, int total_pulse_count, int sample_rate, int block_size, PulseSummary *summary) {
     int pulse_delay = 0;
     float freq_sum = 0.0f;
     int fft_size = 512;
@@ -241,7 +297,13 @@ void pulse_report(FILE *fh, Pulse *pulse, int pulse_count, int total_pulse_count
     float avg_delay = ((float)pulse_delay / (pulse_count - 1)) / sample_rate;
     float ppm = 60.0f / avg_delay;
     float avg_freq = freq_sum / pulse_count;
-    printf("{\"count\": %i, \"frequency\": %.1f, \"delay\": %f, \"ppm\": %f, \"temp\": %0.2f, \"confidence\": %0.2f}\n", pulse_count, avg_freq, avg_delay, ppm, (ppm * (9.0/5.0)) + 32, ((float)pulse_count / total_pulse_count) * 100);
+
+    summary->count       = pulse_count;
+    summary->frequency   = avg_freq;
+    summary->delay       = avg_delay;
+    summary->ppm         = ppm;
+    summary->temperature = (ppm * (9.0/5.0)) + 32;
+    summary->confidence  = ((float)pulse_count / total_pulse_count) * 100;
 
 }
 
@@ -309,6 +371,7 @@ int find_pulse_chain(Pulse *pulse, int pulse_count, int min_chain_length, int ma
 int main(int argc, char **argv) {
     char *filename;
     int block_size         = 64;
+    int window_size        = 256;
     int min_pulse_duration = 15;
     float threshold        = 0.05;
     int required_pulses    = 5;
@@ -318,15 +381,16 @@ int main(int argc, char **argv) {
 
     Pulse pulse[MAX_PULSES];
 
-    while((opt = getopt(argc, argv, "c:d:f:l:r:t:v")) != -1) {
+    while((opt = getopt(argc, argv, "b:c:d:f:r:t:vw:")) != -1) {
         switch(opt) {
+            case 'b': block_size = atoi(optarg); break;
             case 'c': required_pulses = atoi(optarg); break;
             case 'd': min_pulse_duration = atoi(optarg); break;
             case 'f': filename = optarg; break;
-            case 'l': block_size = atoi(optarg); break;
             case 'r': open_raw = true; sample_rate = atoi(optarg); break;
             case 't': threshold = atof(optarg); break;
             case 'v': enable_debug = true; break;
+            case 'w': window_size = atoi(optarg); break;
         }
     }
 
@@ -344,38 +408,66 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    // Find max power
-    float max_power = calculate_max_power(fh, block_size);
+    // Find max power without knowing frequency
+    float max_power = calculate_max_power(fh, block_size, sample_rate, 0);
     debug_log("max_power = %f\n", max_power);
 
-    bool signal_found = false;
     int pulse_count = 0, total_pulse_count = 0;
-    float t_value[] = {1.0f, 0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f, 0.3f, 0.2f, 0.1f, 0.09f, 0.08f, 0.07f, 0.06f, 0.05f, 0.04f, 0.03f, 0.02f, 0.01f};
+    float t_value[] = {20.0f, 19.0f, 18.0f, 17.0f, 16.0f, 15.0f, 14.0f, 13.0f, 12.0f, 11.0f, 10.0f, 9.0f, 8.0f, 7.0f, 6.0f, 5.0f, 4.0f, 3.0f, 2.0f, 1.0f, 0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f, 0.3f, 0.2f, 0.1f, 0.09f, 0.08f, 0.07f, 0.06f, 0.05f, 0.04f, 0.03f, 0.02f, 0.01f};
     int t_count = sizeof(t_value) / sizeof(float);
-    for(int hpf = 0; hpf < 2; hpf++) {
-        if(signal_found) break;
 
-        for(int i = 0; i < t_count; i++) {
-            // Set threshold
-            float t = t_value[i];
-            if(t > max_power) continue;
+    for(int i = 0; i < t_count; i++) {
+        // Set threshold
+        float t = t_value[i];
+        if(t > max_power) continue;
 
-            // Detect pulses
-            total_pulse_count = detect_pulses(fh, pulse, sample_rate, block_size, t, min_pulse_duration, MAX_PULSES, hpf > 0);
+        // Detect pulses
+        total_pulse_count = detect_pulses(fh, pulse, sample_rate, window_size, block_size, t, min_pulse_duration, MAX_PULSES, 0);
 
-            // Find evenly spaced pulses
-            pulse_count = find_pulse_chain(pulse, total_pulse_count, 5, MAX_PULSES, block_size);
+        // Find evenly spaced pulses
+        pulse_count = find_pulse_chain(pulse, total_pulse_count, required_pulses, MAX_PULSES, block_size);
 
-            float ppm = calculate_ppm(pulse, pulse_count, sample_rate);
+        float ppm = calculate_ppm(pulse, pulse_count, sample_rate);
 
-            if(pulse_count >= required_pulses && ppm >= 5.0f && ppm < 100.0f) {
-                signal_found = true;
-                break;
-            }
+        if(pulse_count >= required_pulses && ppm >= 5.0f && ppm < 100.0f) {
+            break;
         }
     }
 
     // Output pulse report
-    pulse_report(fh, pulse, pulse_count, total_pulse_count, sample_rate, block_size);
+    PulseSummary summary;
+    pulse_report(fh, pulse, pulse_count, total_pulse_count, sample_rate, block_size, &summary);
+
+    // Now check for pulses with known frequency
+    max_power = calculate_max_power(fh, block_size, sample_rate, summary.frequency);
+    debug_log("max_power = %f\n", max_power);
+
+    for(int i = 0; i < t_count; i++) {
+        // Set threshold
+        float t = t_value[i];
+        if(t > max_power) continue;
+
+        // Detect pulses
+        debug_log("t = %f\n", t);
+        total_pulse_count = detect_pulses(fh, pulse, sample_rate, window_size, block_size, t, min_pulse_duration, MAX_PULSES, summary.frequency);
+
+        // Find evenly spaced pulses
+        pulse_count = find_pulse_chain(pulse, total_pulse_count, required_pulses, MAX_PULSES, block_size);
+
+        float ppm = calculate_ppm(pulse, pulse_count, sample_rate);
+
+        if(pulse_count >= required_pulses && ppm >= 5.0f && ppm < 100.0f) {
+            break;
+        }
+    }
+
+    PulseSummary summary_g;
+    pulse_report(fh, pulse, pulse_count, total_pulse_count, sample_rate, block_size, &summary_g);
+    printf("[{\"count\": %i, \"frequency\": %.1f, \"delay\": %f, \"ppm\": %f, \"temp\": %0.4f, \"confidence\": %0.2f},\n", summary.count, summary.frequency, summary.delay, summary.ppm, summary.temperature, summary.confidence);
+    printf("{\"count\": %i, \"frequency\": %.1f, \"delay\": %f, \"ppm\": %f, \"temp\": %0.4f, \"confidence\": %0.2f}]\n", summary_g.count, summary_g.frequency, summary_g.delay, summary_g.ppm, summary_g.temperature, summary_g.confidence);
+
+    float c = fabs(summary.temperature - summary_g.temperature);
+    printf("c = %f\n", c);
+
     return 0;
 }
