@@ -61,46 +61,6 @@ _Complex float goertzel_dft_kernel(const float *samples, size_t length, int samp
     return acc;
 }
 
-_Complex float goertzel_dft_kernel_real(const float *samples, size_t length, int sample_rate, float frequency) {
-    float omega = 2.0f * M_PI * (frequency / (float)sample_rate);
-    float coeff = 2.0f * cosf(omega);
-    float p1 = 0;
-    float p2 = 0;
-
-    for(size_t n = 0; n < length; n++) {
-        float s = samples[n] + (coeff * p1) - p2;
-        p2 = p1;
-        p1 = s;
-    }
-
-    float real = (p1 * cosf(omega) - p2);
-    float imag = (p1 * sinf(omega));
-    return real + (I * imag);
-}
-
-float correlate_blocks(float *a, float *b, float *out, int length) {
-    float correlation = 0;
-    float max = 0.0f;
-
-    int possible = 0;
-    for(int i = 0; i < length; i++) {
-        correlation = 0;
-        possible = 0;
-        for(int j = 0; j < length - i; j++) {
-            possible++;
-            correlation += a[i] * b[j + i];
-            //correlation += b[i] * a[j + i];
-        }
-
-        out[i] = correlation / (possible * 1);
-        if(out[i] > max) max = out[i];
-    }
-
-    // After correlating, copy to the old block and normalize it
-    memcpy(a, b, sizeof(float) * length);
-    return max;
-}
-
 FILE *decode_audio_file(char *path, int *sample_rate) {
     FILE *tmp_fh;
     AVFormatContext *fmt_ctx = NULL;
@@ -177,26 +137,30 @@ float calculate_ppm(Pulse *pulse, int pulse_count, int sample_rate) {
     return ppm;
 }
 
-float calculate_max_power(FILE *fh, int block_size, int sample_rate, float target_frequency) {
-    float samples[block_size];
+float calculate_max_power(FILE *fh, int window_size, int block_size, int sample_rate, float target_frequency) {
+    float samples[window_size];
     float max_power = 0.0f;
     float power;
     size_t bytes;
 
+    int block_offset = window_size - block_size;
+
     fseek(fh, 0, SEEK_SET);
-    while((bytes = fread(samples, sizeof(float), block_size, fh)) > 0) {
+    if(block_offset > 0) fread(samples, sizeof(float), block_offset, fh);
+    while((bytes = fread(&samples[block_offset], sizeof(float), block_size, fh)) > 0) {
         if(target_frequency == 0) {
-            power = calculate_power(samples, block_size);
+            power = calculate_power(samples, window_size);
         } else {
-            power = cabs(goertzel_dft_kernel(samples, block_size, sample_rate, target_frequency));
+            power = cabs(goertzel_dft_kernel(samples, window_size, sample_rate, target_frequency));
         }
         if(power > max_power) max_power = power;
+
+        if(block_offset > 0) memmove(samples, &samples[block_size], sizeof(float) * block_offset);
     }
 
     return max_power;
 }
 
-uint8_t g_first_run = 1;
 int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int window_size, int block_size, float threshold, int min_pulse_duration, int max_pulses, float target_frequency) {
     float samples[window_size];
     int min_pulse_samples = (sample_rate / 1000) * min_pulse_duration;
@@ -242,7 +206,6 @@ int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int window_size, int 
         if(block_offset > 0) memmove(samples, &samples[block_size], sizeof(float) * block_offset);
     }
 
-    if(target_frequency != 0) g_first_run = 0;
     return pulse_count;
 }
 
@@ -321,6 +284,7 @@ int find_pulse_chain(Pulse *pulse, int pulse_count, int min_chain_length, int ma
     if(pulse_count < 3 || pulse_count < min_chain_length) return 0;
 
     while(l1 < pulse_count - (min_chain_length - 1)) {
+        bool end_of_chain = false;
         // Using the average distance between starts and ends ensures uniform pulse length also
         d = ((pulse[l3].end - pulse[l2].end) + (pulse[l3].start - pulse[l2].start)) / 2;
 
@@ -332,6 +296,13 @@ int find_pulse_chain(Pulse *pulse, int pulse_count, int min_chain_length, int ma
             l3++;
         } else if(d > dt) {
             // Further chain is imposible from these nodes
+            end_of_chain = true;
+        } else {
+            // Check next possible link
+            l3++;
+        }
+
+        if(end_of_chain || l3 == pulse_count) {
             // If we have enough links, see if it's the longest chain
             if(chain_length >= min_chain_length && chain_length > longest_chain_length) {
                 debug_log("Found new pulse chain with length %i\n", chain_length);
@@ -347,9 +318,6 @@ int find_pulse_chain(Pulse *pulse, int pulse_count, int min_chain_length, int ma
             chain_length = 2;
             chain[0] = l1;
             chain[1] = l2;
-        } else {
-            // Check next possible link
-            l3++;
         }
     }
 
@@ -409,7 +377,7 @@ int main(int argc, char **argv) {
     }
 
     // Find max power without knowing frequency
-    float max_power = calculate_max_power(fh, block_size, sample_rate, 0);
+    float max_power = calculate_max_power(fh, window_size, block_size, sample_rate, 0);
     debug_log("max_power = %f\n", max_power);
 
     int pulse_count = 0, total_pulse_count = 0;
@@ -439,7 +407,7 @@ int main(int argc, char **argv) {
     pulse_report(fh, pulse, pulse_count, total_pulse_count, sample_rate, block_size, &summary);
 
     // Now check for pulses with known frequency
-    max_power = calculate_max_power(fh, block_size, sample_rate, summary.frequency);
+    max_power = calculate_max_power(fh, window_size, block_size, sample_rate, summary.frequency);
     debug_log("max_power = %f\n", max_power);
 
     for(int i = 0; i < t_count; i++) {
@@ -466,8 +434,8 @@ int main(int argc, char **argv) {
     printf("[{\"count\": %i, \"frequency\": %.1f, \"delay\": %f, \"ppm\": %f, \"temp\": %0.4f, \"confidence\": %0.2f},\n", summary.count, summary.frequency, summary.delay, summary.ppm, summary.temperature, summary.confidence);
     printf("{\"count\": %i, \"frequency\": %.1f, \"delay\": %f, \"ppm\": %f, \"temp\": %0.4f, \"confidence\": %0.2f}]\n", summary_g.count, summary_g.frequency, summary_g.delay, summary_g.ppm, summary_g.temperature, summary_g.confidence);
 
-    float c = fabs(summary.temperature - summary_g.temperature);
-    printf("c = %f\n", c);
+    //float c = fabs(summary.temperature - summary_g.temperature);
+    //printf("c = %f\n", c);
 
     return 0;
 }
