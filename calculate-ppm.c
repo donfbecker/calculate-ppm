@@ -51,15 +51,34 @@ float calculate_power(float *samples, int length) {
     return sqrt(power / length);
 }
 
-_Complex float goertzel_dft_kernel(const float *samples, size_t length, int sample_rate, float frequency) {
+// This is an unoptimized version
+_Complex float goertzel_dft_kernel2(const float *samples, size_t length, int sample_rate, float frequency) {
     _Complex float acc = 0.0f + 0.0f * I;
     float omega = -2.0f * M_PI * (frequency / (float)sample_rate);
     for (size_t n = 0; n < length; n++) {
         acc += samples[n] * cexpf(I * omega * n);
     }
 
-    return acc;
+    return acc / length;
 }
+
+// This version has been optimized
+_Complex float goertzel_dft_kernel(const float *samples, size_t length, int sample_rate, float frequency) {
+    float omega = -2.0f * M_PI * (float)frequency / (float)sample_rate;
+    float coeff = 2.0f * cosf(omega);
+    _Complex float exp = cexpf(I * omega);
+    _Complex float s1 = 0.0f + 0.0f * I;
+    _Complex float s2 = 0.0f + 0.0f * I;
+
+    for (size_t n = 0; n < length; n++) {
+        _Complex float s = samples[n] + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s;
+    }
+
+    return (s1 - s2 * exp) / length;
+}
+
 
 FILE *decode_audio_file(char *path, int *sample_rate) {
     FILE *tmp_fh;
@@ -159,6 +178,24 @@ float calculate_max_power(FILE *fh, int window_size, int block_size, int sample_
     }
 
     return max_power;
+}
+
+float calculate_total_power(FILE *fh, int window_size, int block_size, int sample_rate, float target_frequency) {
+    float samples[window_size];
+    float power = 0.0f;
+    size_t bytes;
+
+    int block_offset = window_size - block_size;
+
+    fseek(fh, 0, SEEK_SET);
+    if(block_offset > 0) fread(samples, sizeof(float), block_offset, fh);
+    while((bytes = fread(&samples[block_offset], sizeof(float), block_size, fh)) > 0) {
+        power += cabs(goertzel_dft_kernel(samples, window_size, sample_rate, target_frequency));
+
+        if(block_offset > 0) memmove(samples, &samples[block_size], sizeof(float) * block_offset);
+    }
+
+    return power;
 }
 
 int detect_pulses(FILE *fh, Pulse *pulse, int sample_rate, int window_size, int block_size, float threshold, int min_pulse_duration, int max_pulses, float target_frequency) {
@@ -376,12 +413,14 @@ int main(int argc, char **argv) {
         return -1;
     }
 
+    // Get file size
+
     // Find max power without knowing frequency
     float max_power = calculate_max_power(fh, window_size, block_size, sample_rate, 0);
     debug_log("max_power = %f\n", max_power);
 
     int pulse_count = 0, total_pulse_count = 0;
-    float t_value[] = {20.0f, 19.0f, 18.0f, 17.0f, 16.0f, 15.0f, 14.0f, 13.0f, 12.0f, 11.0f, 10.0f, 9.0f, 8.0f, 7.0f, 6.0f, 5.0f, 4.0f, 3.0f, 2.0f, 1.0f, 0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f, 0.3f, 0.2f, 0.1f, 0.09f, 0.08f, 0.07f, 0.06f, 0.05f, 0.04f, 0.03f, 0.02f, 0.01f};
+    float t_value[] = {20.0f, 19.0f, 18.0f, 17.0f, 16.0f, 15.0f, 14.0f, 13.0f, 12.0f, 11.0f, 10.0f, 9.0f, 8.0f, 7.0f, 6.0f, 5.0f, 4.0f, 3.0f, 2.0f, 1.0f, 0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f, 0.3f, 0.2f, 0.1f, 0.09f, 0.08f, 0.07f, 0.06f, 0.05f, 0.04f, 0.03f, 0.02f, 0.01f, 0.009f, 0.008f, 0.007f, 0.006f, 0.005f, 0.004f, 0.003f, 0.002f, 0.001f };
     int t_count = sizeof(t_value) / sizeof(float);
 
     for(int i = 0; i < t_count; i++) {
@@ -404,6 +443,7 @@ int main(int argc, char **argv) {
 
     // Output pulse report
     PulseSummary summary;
+    if(pulse_count < required_pulses) pulse_count = 0;
     pulse_report(fh, pulse, pulse_count, total_pulse_count, sample_rate, block_size, &summary);
 
     // Now check for pulses with known frequency
@@ -430,9 +470,45 @@ int main(int argc, char **argv) {
     }
 
     PulseSummary summary_g;
+    if(pulse_count < required_pulses) pulse_count = 0;
     pulse_report(fh, pulse, pulse_count, total_pulse_count, sample_rate, block_size, &summary_g);
+
+    // Now sweep the frequencies
+    bool signal_found = false;
+    for(int f = 500; f <= 4000; f += 100) {
+        max_power = calculate_max_power(fh, window_size, block_size, sample_rate, (float)f);
+        debug_log("max_power = %f at %i hz\n", max_power, f);
+
+        for(int i = 0; i < t_count; i++) {
+            // Set threshold
+            float t = t_value[i];
+            if(t > max_power) continue;
+
+            // Detect pulses
+            debug_log("t = %f\n", t);
+            total_pulse_count = detect_pulses(fh, pulse, sample_rate, window_size, block_size, t, min_pulse_duration, MAX_PULSES, (float)f);
+
+            // Find evenly spaced pulses
+            pulse_count = find_pulse_chain(pulse, total_pulse_count, required_pulses, MAX_PULSES, block_size);
+
+            float ppm = calculate_ppm(pulse, pulse_count, sample_rate);
+
+            if(pulse_count >= required_pulses && ppm >= 5.0f && ppm < 100.0f) {
+                signal_found = true;
+                break;
+            }
+        }
+
+        if(signal_found) break;
+    }
+
+    PulseSummary summary_s;
+    if(pulse_count < required_pulses) pulse_count = 0;
+    pulse_report(fh, pulse, pulse_count, total_pulse_count, sample_rate, block_size, &summary_s);
+
     printf("[{\"count\": %i, \"frequency\": %.1f, \"delay\": %f, \"ppm\": %f, \"temp\": %0.4f, \"confidence\": %0.2f},\n", summary.count, summary.frequency, summary.delay, summary.ppm, summary.temperature, summary.confidence);
-    printf("{\"count\": %i, \"frequency\": %.1f, \"delay\": %f, \"ppm\": %f, \"temp\": %0.4f, \"confidence\": %0.2f}]\n", summary_g.count, summary_g.frequency, summary_g.delay, summary_g.ppm, summary_g.temperature, summary_g.confidence);
+    printf("{\"count\": %i, \"frequency\": %.1f, \"delay\": %f, \"ppm\": %f, \"temp\": %0.4f, \"confidence\": %0.2f},\n", summary_g.count, summary_g.frequency, summary_g.delay, summary_g.ppm, summary_g.temperature, summary_g.confidence);
+    printf("{\"count\": %i, \"frequency\": %.1f, \"delay\": %f, \"ppm\": %f, \"temp\": %0.4f, \"confidence\": %0.2f}]\n", summary_s.count, summary_s.frequency, summary_s.delay, summary_s.ppm, summary_s.temperature, summary_s.confidence);
 
     //float c = fabs(summary.temperature - summary_g.temperature);
     //printf("c = %f\n", c);
